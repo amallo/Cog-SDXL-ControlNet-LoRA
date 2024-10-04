@@ -35,12 +35,15 @@ from safetensors.torch import load_file
 from transformers import CLIPImageProcessor
 
 from dataset_and_utils import TokenEmbeddingsHandler
+from prompt import PROMPT_GENERAL, NEGATIVE_PROMPT
+
 
 CONTROL_CACHE = "control-cache"
 SDXL_MODEL_CACHE = "./sdxl-cache"
 REFINER_MODEL_CACHE = "./refiner-cache"
 SAFETY_CACHE = "./safety-cache"
 FEATURE_EXTRACTOR = "./feature-extractor"
+LORA_WEIGHTS = "./trained_model"
 SDXL_URL = "https://weights.replicate.delivery/default/sdxl/sdxl-vae-upcast-fix.tar"
 REFINER_URL = (
     "https://weights.replicate.delivery/default/sdxl/refiner-no-vae-no-encoder-1.0.tar"
@@ -77,7 +80,6 @@ class Predictor(BasePredictor):
     def setup(self, weights: Optional[Path] = None):
         """Load the model into memory to make running multiple predictions efficient"""
         start = time.time()
-        self.tuned_model = False
         self.tuned_weights = None
         if str(weights) == "weights":
             weights = None
@@ -111,9 +113,9 @@ class Predictor(BasePredictor):
         self.is_lora = False
         #if weights or os.path.exists("./trained-model"):
             #self.load_trained_weights(weights, self.control_text2img_pipe)
-        if not os.path.exists("./trained-model"):
-            download_weights("https://replicate.delivery/pbxt/dwlcMNj38xJ1CxrneqrFjT64NtQ0N38G7LrcOf87dPBWqRbTA/trained_model.tar", "./trained-model")
-        self.control_text2img_pipe.load_lora_weights("./trained-model/lora.safetensors")       
+        #if not os.path.exists(LORA_WEIGHTS):
+        #    download_weights("https://replicate.delivery/pbxt/dwlcMNj38xJ1CxrneqrFjT64NtQ0N38G7LrcOf87dPBWqRbTA/trained_model.tar", "./trained-model")
+        self.control_text2img_pipe.load_lora_weights(LORA_WEIGHTS , weight_naname = "lora.safetensors", adapter_name='general_lora')       
 
         if not os.path.exists(REFINER_MODEL_CACHE):
             download_weights(REFINER_URL, REFINER_MODEL_CACHE)
@@ -192,15 +194,29 @@ class Predictor(BasePredictor):
         self,
         prompt: str = Input(
             description="Input prompt",
-            default="An astronaut riding a rainbow unicorn",
+            default=PROMPT_GENERAL,
         ),
         negative_prompt: str = Input(
             description="Input Negative Prompt",
-            default="",
+            default=NEGATIVE_PROMPT,
         ),
         image: Path = Input(
             description="Input image for img2img or inpaint mode",
             default=None,
+        ),
+        prevent_nsfw: bool = Input(
+            description="Prevent nsfw content",
+            default=True,
+        ),
+        strength: float = Input(
+            description="A higher value enforce image destruction",
+            default=0.8,
+            ge=0.0,
+            le=1.0,
+        ),
+        disable_lora: bool = Input(
+            description="Use LORA",
+            default=False,
         ),
         condition_scale: float = Input(
             description="The bigger this number is, the more ControlNet interferes",
@@ -258,10 +274,6 @@ class Predictor(BasePredictor):
             self.control_text2img_pipe.vae.to(dtype=torch.float16)
 
         sdxl_kwargs = {}
-        if self.tuned_model:
-            # consistency with fine-tuning API
-            for k, v in self.token_map.items():
-                prompt = prompt.replace(k, v)
         print(f"Prompt: {prompt}")
         image = self.load_image(image)
         image, width, height = self.resize_image(image)
@@ -270,7 +282,9 @@ class Predictor(BasePredictor):
         sdxl_kwargs["controlnet_conditioning_scale"] = condition_scale
         sdxl_kwargs["width"] = width
         sdxl_kwargs["height"] = height
+        sdxl_kwargs["strength"] = strength
         pipe = self.control_text2img_pipe
+        pipe.fuse_lora(lora_scale=lora_scale)
 
         if refine == "base_image_refiner":
             sdxl_kwargs["output_type"] = "latent"
@@ -292,8 +306,7 @@ class Predictor(BasePredictor):
             "num_inference_steps": num_inference_steps,
         }
 
-        if self.is_lora:
-            sdxl_kwargs["cross_attention_kwargs"] = {"scale": lora_scale}
+        sdxl_kwargs["cross_attention_kwargs"] = {"scale": lora_scale}
 
         output = pipe(**common_args, **sdxl_kwargs)
 
@@ -310,16 +323,17 @@ class Predictor(BasePredictor):
             pipe.watermark = watermark_cache
             self.refiner.watermark = watermark_cache
 
-        _, has_nsfw_content = self.run_safety_checker(output.images)
+        if prevent_nsfw:
+            _, has_nsfw_content = self.run_safety_checker(output.images)
 
-        output_paths = []
-        for i, nsfw in enumerate(has_nsfw_content):
-            if nsfw:
-                print(f"NSFW content detected in image {i}")
-                continue
-            output_path = f"/tmp/out-{i}.png"
-            output.images[i].save(output_path)
-            output_paths.append(Path(output_path))
+            output_paths = []
+            for i, nsfw in enumerate(has_nsfw_content):
+                if nsfw:
+                    print(f"NSFW content detected in image {i}")
+                    continue
+                output_path = f"/tmp/out-{i}.png"
+                output.images[i].save(output_path)
+                output_paths.append(Path(output_path))
 
         if len(output_paths) == 0:
             raise Exception(
