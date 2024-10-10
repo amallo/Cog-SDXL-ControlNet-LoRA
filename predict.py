@@ -14,6 +14,7 @@ from PIL import Image
 from diffusers import (
     DDIMScheduler,
     DiffusionPipeline,
+    UniPCMultistepScheduler,
     DPMSolverMultistepScheduler,
     EulerAncestralDiscreteScheduler,
     EulerDiscreteScheduler,
@@ -43,12 +44,18 @@ SDXL_MODEL_CACHE = "./sdxl-cache"
 REFINER_MODEL_CACHE = "./refiner-cache"
 SAFETY_CACHE = "./safety-cache"
 FEATURE_EXTRACTOR = "./feature-extractor"
-LORA_WEIGHTS = "./trained_model"
 SDXL_URL = "https://weights.replicate.delivery/default/sdxl/sdxl-vae-upcast-fix.tar"
 REFINER_URL = (
     "https://weights.replicate.delivery/default/sdxl/refiner-no-vae-no-encoder-1.0.tar"
 )
 SAFETY_URL = "https://weights.replicate.delivery/default/sdxl/safety-1.0.tar"
+LORA_WAR = "https://replicate.delivery/pbxt/SqRHCOhHkOoGJ5mW93YW0F863hV6IJ1vf96RvI5v65cWofkTA/trained_model.tar"
+LORAS = {
+    'abandon': "./trained_model/abandon",
+    'vegetation': "./trained_model/vegetation",
+    'war': "./trained_model/war"
+}
+
 
 
 class KarrasDPM:
@@ -64,6 +71,7 @@ SCHEDULERS = {
     "K_EULER_ANCESTRAL": EulerAncestralDiscreteScheduler,
     "K_EULER": EulerDiscreteScheduler,
     "PNDM": PNDMScheduler,
+    "UNI_PC_MULTISTEP": UniPCMultistepScheduler
 }
 
 
@@ -110,13 +118,11 @@ class Predictor(BasePredictor):
             variant="fp16",
         )
         self.control_text2img_pipe.to("cuda")
-        self.is_lora = False
-        #if weights or os.path.exists("./trained-model"):
-            #self.load_trained_weights(weights, self.control_text2img_pipe)
-        #if not os.path.exists(LORA_WEIGHTS):
-        #    download_weights("https://replicate.delivery/pbxt/dwlcMNj38xJ1CxrneqrFjT64NtQ0N38G7LrcOf87dPBWqRbTA/trained_model.tar", "./trained-model")
-        self.control_text2img_pipe.load_lora_weights(LORA_WEIGHTS , weight_naname = "lora.safetensors", adapter_name='general_lora')       
-
+        
+        self.control_text2img_pipe.load_lora_weights(LORAS["abandon"] , weight_name = "lora.safetensors", adapter_name='abandon') 
+        self.control_text2img_pipe.load_lora_weights(LORAS["vegetation"] , weight_name = "lora.safetensors", adapter_name='vegetation') 
+        #self.control_text2img_pipe.load_lora_weights(LORAS["war"] , weight_name = "lora.safetensors", adapter_name='war')  
+        
         if not os.path.exists(REFINER_MODEL_CACHE):
             download_weights(REFINER_URL, REFINER_MODEL_CACHE)
 
@@ -214,10 +220,6 @@ class Predictor(BasePredictor):
             ge=0.0,
             le=1.0,
         ),
-        disable_lora: bool = Input(
-            description="Use LORA",
-            default=False,
-        ),
         condition_scale: float = Input(
             description="The bigger this number is, the more ControlNet interferes",
             default=0.5,
@@ -257,11 +259,23 @@ class Predictor(BasePredictor):
             description="Applies a watermark to enable determining if an image is generated in downstream applications. If you have other provisions for generating or deploying images safely, you can use this to disable watermarking.",
             default=True,
         ),
-        lora_scale: float = Input(
-            description="LoRA additive scale. Only applicable on trained models.",
+        abandon_scale: float = Input(
+            description="LoRA additive scale on abandoned buildings.",
             ge=0.0,
             le=1.0,
             default=0.6,
+        ),
+        vegetation_scale: float = Input(
+            description="LoRA additive scale on vegetation.",
+            ge=0.0,
+            le=1.0,
+            default=0.3,
+        ),
+        destruction_scale: float = Input(
+            description="LoRA additive scale on destruction, war, ruins.",
+            ge=0.0,
+            le=1.0,
+            default=0.1,
         ),
     ) -> List[Path]:
         """Run a single prediction on the model"""
@@ -272,6 +286,7 @@ class Predictor(BasePredictor):
         # OOMs can leave vae in bad state
         if self.control_text2img_pipe.vae.dtype == torch.float32:
             self.control_text2img_pipe.vae.to(dtype=torch.float16)
+
 
         sdxl_kwargs = {}
         print(f"Prompt: {prompt}")
@@ -284,7 +299,17 @@ class Predictor(BasePredictor):
         sdxl_kwargs["height"] = height
         sdxl_kwargs["strength"] = strength
         pipe = self.control_text2img_pipe
-        pipe.fuse_lora(lora_scale=lora_scale)
+
+        adapters = {}
+        if abandon_scale>0:
+            adapters['abandon'] = abandon_scale
+        if vegetation_scale > 0:
+            adapters['vegetation'] = vegetation_scale
+        #if destruction_scale > 0:
+        #    adapters['war'] = destruction_scale
+        
+        
+        pipe.set_adapters(list(adapters.keys()), adapter_weights=list(adapters.values()))
 
         if refine == "base_image_refiner":
             sdxl_kwargs["output_type"] = "latent"
@@ -306,7 +331,7 @@ class Predictor(BasePredictor):
             "num_inference_steps": num_inference_steps,
         }
 
-        sdxl_kwargs["cross_attention_kwargs"] = {"scale": lora_scale}
+        sdxl_kwargs["cross_attention_kwargs"] = {"scale": 1.0}
 
         output = pipe(**common_args, **sdxl_kwargs)
 
