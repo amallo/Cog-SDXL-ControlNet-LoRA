@@ -41,10 +41,12 @@ from prompt import PROMPT_GENERAL, NEGATIVE_PROMPT
 
 CONTROL_CACHE = "control-cache"
 SDXL_MODEL_CACHE = "./sdxl-cache"
+REALVISXL_MODEL_CACHE = "./RealVisXL_V3.0"
 REFINER_MODEL_CACHE = "./refiner-cache"
 SAFETY_CACHE = "./safety-cache"
 FEATURE_EXTRACTOR = "./feature-extractor"
 SDXL_URL = "https://weights.replicate.delivery/default/sdxl/sdxl-vae-upcast-fix.tar"
+REALVISXL_URL = "https://weights.replicate.delivery/default/RealVisXL/RealVisXL_V3.0.tar"
 REFINER_URL = (
     "https://weights.replicate.delivery/default/sdxl/refiner-no-vae-no-encoder-1.0.tar"
 )
@@ -101,8 +103,8 @@ class Predictor(BasePredictor):
         ).to("cuda")
         self.feature_extractor = CLIPImageProcessor.from_pretrained(FEATURE_EXTRACTOR)
 
-        if not os.path.exists(SDXL_MODEL_CACHE):
-            download_weights(SDXL_URL, SDXL_MODEL_CACHE)
+        #if not os.path.exists(SDXL_MODEL_CACHE):
+        #    download_weights(SDXL_URL, SDXL_MODEL_CACHE)
 
         controlnet = ControlNetModel.from_pretrained(
             CONTROL_CACHE,
@@ -111,7 +113,7 @@ class Predictor(BasePredictor):
 
         print("Loading SDXL Controlnet pipeline...")
         self.control_text2img_pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-            SDXL_MODEL_CACHE,
+            REALVISXL_MODEL_CACHE,
             controlnet=controlnet,
             torch_dtype=torch.float16,
             use_safetensors=True,
@@ -271,12 +273,6 @@ class Predictor(BasePredictor):
             le=1.0,
             default=0.3,
         ),
-        destruction_scale: float = Input(
-            description="LoRA additive scale on destruction, war, ruins.",
-            ge=0.0,
-            le=1.0,
-            default=0.1,
-        ),
     ) -> List[Path]:
         """Run a single prediction on the model"""
         if seed is None:
@@ -301,15 +297,15 @@ class Predictor(BasePredictor):
         pipe = self.control_text2img_pipe
 
         adapters = {}
-        if abandon_scale>0:
-            adapters['abandon'] = abandon_scale
-        if vegetation_scale > 0:
-            adapters['vegetation'] = vegetation_scale
-        #if destruction_scale > 0:
-        #    adapters['war'] = destruction_scale
-        
-        
-        pipe.set_adapters(list(adapters.keys()), adapter_weights=list(adapters.values()))
+        if abandon_scale == 0 and vegetation_scale == 0:
+            pipe.disable_lora()
+        else:    
+            pipe.enable_lora()
+            if abandon_scale>0:
+                adapters['abandon'] = abandon_scale
+            if vegetation_scale > 0:
+                adapters['vegetation'] = vegetation_scale    
+            pipe.set_adapters(list(adapters.keys()), adapter_weights=list(adapters.values()))
 
         if refine == "base_image_refiner":
             sdxl_kwargs["output_type"] = "latent"
